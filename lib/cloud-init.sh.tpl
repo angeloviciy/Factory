@@ -7,6 +7,7 @@ GH_TOKEN="__GH_TOKEN__"
 REPO="__REPO__"
 BRANCH="__BRANCH__"
 SETUP_CMD="__SETUP_CMD__"
+FACTORY_WEBHOOK_URL="__FACTORY_WEBHOOK_URL__"
 
 # === Self-destruct on exit ===
 DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
@@ -22,6 +23,7 @@ self_destruct() {
 cat > /root/.secrets <<SECRETS
 export GH_TOKEN="$GH_TOKEN"
 export DO_API_TOKEN="$DO_API_TOKEN"
+export FACTORY_WEBHOOK_URL="$FACTORY_WEBHOOK_URL"
 SECRETS
 chmod 600 /root/.secrets
 
@@ -77,6 +79,7 @@ self_destruct() {
 trap self_destruct EXIT
 
 cd /root/repo
+START_TIME=$(date +%s)
 
 PLAN=$(cat /root/plan.md)
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
@@ -85,6 +88,7 @@ echo "[factory] Starting agent run at $(date)"
 echo "[factory] Branch: $BRANCH"
 echo "[factory] Plan: /root/plan.md"
 
+AGENT_STATUS=0
 claude -p "You are an autonomous coding agent. Execute the following implementation plan precisely.
 Work through each step. Run tests if they exist. Commit your work as you go with clear commit messages.
 When done, push your branch and create a pull request.
@@ -96,14 +100,14 @@ $PLAN" \
     --max-turns 200 \
     --output-format stream-json \
     --verbose \
-    > /root/agent.log 2>&1
+    > /root/agent.log 2>&1 || AGENT_STATUS=$?
 
 echo "[factory] Agent finished at $(date)"
 
 # Push and create PR if there are commits
 if [ "$(git log origin/$BRANCH..$BRANCH 2>/dev/null | head -1)" != "" ] || [ "$BRANCH" != "main" ]; then
     git push -u origin "$BRANCH" 2>/dev/null || git push --set-upstream origin "$BRANCH"
-    gh pr create \
+    PR_URL=$(gh pr create \
         --title "factory: $(head -1 /root/plan.md | sed 's/^#* *//')" \
         --body "$(cat <<'EOF'
 ## Automated by Factory
@@ -116,7 +120,30 @@ $(cat /root/plan.md)
 ---
 Review the changes carefully before merging.
 EOF
-)" 2>/dev/null || echo "[factory] PR already exists or could not be created"
+)" 2>/dev/null) || PR_URL=""
+    [ -z "$PR_URL" ] && echo "[factory] PR already exists or could not be created"
+fi
+
+# Send completion notification
+if [ -n "${FACTORY_WEBHOOK_URL:-}" ]; then
+    DROPLET_NAME=$(hostname)
+    END_TIME=$(date +%s)
+    DURATION=$(( (END_TIME - START_TIME) / 60 ))
+    REPO_NAME=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || echo "unknown")
+
+    if [ "$AGENT_STATUS" -eq 0 ]; then
+        STATUS="success"
+        TITLE="Agent finished: $REPO_NAME"
+    else
+        STATUS="failure"
+        TITLE="Agent failed: $REPO_NAME"
+    fi
+
+    curl -s -X POST "$FACTORY_WEBHOOK_URL" \
+        -H "Title: $TITLE" \
+        -H "Tags: ${STATUS}" \
+        -d "Branch: $BRANCH | Duration: ${DURATION}m | PR: ${PR_URL:-none} | Droplet: $DROPLET_NAME" \
+        > /dev/null 2>&1 || true
 fi
 
 echo "[factory] Done. Droplet will self-destruct."

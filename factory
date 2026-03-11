@@ -44,6 +44,7 @@ Commands:
   status                              List running factory droplets
   teardown [--all]                    Destroy factory droplets
   logs <droplet-ip>                   Tail agent logs from a running droplet
+  notify-setup                         Set up ntfy.sh notifications for agent completion
 
 Launch options:
   --repo <owner/repo>                 GitHub repo (default: auto-detected from cwd, or $DEFAULT_REPO)
@@ -156,6 +157,7 @@ cmd_launch() {
         -e "s|__REPO__|$repo|g" \
         -e "s|__BRANCH__|$branch|g" \
         -e "s|__SETUP_CMD__|$setup_cmd|g" \
+        -e "s|__FACTORY_WEBHOOK_URL__|${FACTORY_WEBHOOK_URL:-}|g" \
         "$FACTORY_DIR/lib/cloud-init.sh.tpl" > "$tmp_init"
 
     local droplet_name="factory-$(date +%s)"
@@ -325,6 +327,29 @@ cmd_teardown() {
     fi
 }
 
+# ─── notify-setup ──────────────────────────────────────
+
+cmd_notify_setup() {
+    local topic="factory-$(head -c 4 /dev/urandom | xxd -p)"
+    local url="https://ntfy.sh/$topic"
+
+    if grep -q "^FACTORY_WEBHOOK_URL=" "$FACTORY_DIR/.env" 2>/dev/null; then
+        sed -i "s|^FACTORY_WEBHOOK_URL=.*|FACTORY_WEBHOOK_URL=$url|" "$FACTORY_DIR/.env"
+    else
+        echo "FACTORY_WEBHOOK_URL=$url" >> "$FACTORY_DIR/.env"
+    fi
+
+    echo "Notification topic created: $url"
+    echo ""
+    echo "Subscribe to get notified when agents finish:"
+    echo "  Browser: $url"
+    echo "  CLI:     curl -s $url/json"
+    echo ""
+    echo "Or install the ntfy app: https://ntfy.sh"
+    echo ""
+    echo "Written to .env: FACTORY_WEBHOOK_URL=$url"
+}
+
 # ─── main ───────────────────────────────────────────────
 
 cmd="${1:-}"
@@ -338,5 +363,6 @@ case "$cmd" in
     status)   cmd_status ;;
     logs)     cmd_logs "$@" ;;
     teardown) cmd_teardown "$@" ;;
+    notify-setup) cmd_notify_setup ;;
     *)        usage ;;
 esac
