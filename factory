@@ -1,0 +1,342 @@
+#!/bin/bash
+set -euo pipefail
+
+# FACTORY_DIR = where Factory repo lives (config, templates, plans)
+# Resolve through symlinks so this works from ~/.local/bin/factory
+FACTORY_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0")")" && pwd)"
+
+# PROJECT_DIR = where the user invoked factory from (their codebase)
+PROJECT_DIR="$(pwd)"
+
+# Load .env
+if [ -f "$FACTORY_DIR/.env" ]; then
+    set -a
+    source "$FACTORY_DIR/.env"
+    set +a
+fi
+
+# Auto-detect repo from current git directory
+detect_repo() {
+    local remote
+    remote=$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || echo "")
+    if [ -n "$remote" ]; then
+        # Extract owner/repo from git@github.com:owner/repo.git or https://github.com/owner/repo.git
+        echo "$remote" | sed -E 's|.*github\.com[:/]||; s|\.git$||'
+    fi
+}
+
+# Auto-detect current branch
+detect_branch() {
+    git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "main"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: factory <command> [options]
+
+Run from any git repo. Factory auto-detects the repo and branch from your cwd.
+
+Commands:
+  plan <prd-file>                     Generate implementation plan from a PRD (runs locally, in your codebase)
+  launch [options]                    Create and bootstrap a DigitalOcean droplet
+  auth <droplet-ip>                   SSH in with port forwarding for Claude OAuth
+  run <droplet-ip> <plan-file>        Ship plan and start autonomous agent
+  status                              List running factory droplets
+  teardown [--all]                    Destroy factory droplets
+  logs <droplet-ip>                   Tail agent logs from a running droplet
+
+Launch options:
+  --repo <owner/repo>                 GitHub repo (default: auto-detected from cwd, or $DEFAULT_REPO)
+  --branch <name>                     Branch to create/checkout (default: auto-detected from cwd)
+  --setup <command>                   Setup command to run after clone (e.g. "npm install")
+  --size <slug>                       Droplet size (default: $DO_SIZE from .env)
+  --region <slug>                     Droplet region (default: $DO_REGION from .env)
+
+Examples:
+  cd ~/Code/my-project
+  factory plan prd.md                 # Claude reads YOUR codebase to make the plan
+  factory launch --setup "npm install"  # auto-detects repo + branch from cwd
+  factory auth 1.2.3.4
+  factory run 1.2.3.4 ~/Documents/GitHub/Factory/plans/plan-prd-*.md
+EOF
+}
+
+# ─── plan ───────────────────────────────────────────────
+
+cmd_plan() {
+    local prd_file="${1:?Usage: factory plan <prd-file>}"
+
+    # Resolve prd_file relative to caller's directory
+    if [[ "$prd_file" != /* ]]; then
+        prd_file="$PROJECT_DIR/$prd_file"
+    fi
+
+    if [ ! -f "$prd_file" ]; then
+        echo "Error: PRD file not found: $prd_file"
+        exit 1
+    fi
+
+    local plan_name
+    plan_name="plan-$(basename "$prd_file" .md)-$(date +%Y%m%d-%H%M%S).md"
+    local plan_path="$FACTORY_DIR/plans/$plan_name"
+    mkdir -p "$FACTORY_DIR/plans"
+
+    echo "Project:  $PROJECT_DIR"
+    echo "PRD:      $prd_file"
+    echo "Plan:     $plan_path"
+    echo ""
+
+    # Run Claude in the PROJECT directory so it has full codebase context
+    (cd "$PROJECT_DIR" && claude -p "Read the following PRD and produce a detailed, step-by-step implementation plan.
+
+You have access to the full codebase in the current directory. Explore it to understand the existing architecture, conventions, and patterns before planning.
+
+Output as a numbered markdown checklist. Each step should be specific and actionable — name the files to create/modify, the functions to write, the tests to add. The plan should be executable by an autonomous coding agent with no further human input.
+
+PRD:
+$(cat "$prd_file")" \
+        --allowedTools "Read,Glob,Grep" \
+        > "$plan_path")
+
+    echo ""
+    echo "Plan written to: $plan_path"
+    echo "Review it, edit if needed, then run:"
+    echo "  factory launch"
+    echo "  factory auth <ip>"
+    echo "  factory run <ip> $plan_path"
+}
+
+# ─── launch ─────────────────────────────────────────────
+
+cmd_launch() {
+    local repo=""
+    local branch=""
+    local setup_cmd=""
+    local size="${DO_SIZE:-s-2vcpu-4gb}"
+    local region="${DO_REGION:-nyc1}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --repo)    repo="$2"; shift 2 ;;
+            --branch)  branch="$2"; shift 2 ;;
+            --setup)   setup_cmd="$2"; shift 2 ;;
+            --size)    size="$2"; shift 2 ;;
+            --region)  region="$2"; shift 2 ;;
+            *)         echo "Unknown option: $1"; exit 1 ;;
+        esac
+    done
+
+    # Auto-detect from cwd if not specified
+    if [ -z "$repo" ]; then
+        repo=$(detect_repo)
+    fi
+    if [ -z "$repo" ]; then
+        repo="${DEFAULT_REPO:-}"
+    fi
+    if [ -z "$branch" ]; then
+        branch=$(detect_branch)
+    fi
+
+    if [ -z "$repo" ]; then
+        echo "Error: No repo detected. Run from a git repo, use --repo owner/name, or set DEFAULT_REPO in .env"
+        exit 1
+    fi
+
+    # Validate required env vars
+    : "${DO_API_TOKEN:?Set DO_API_TOKEN in .env}"
+    : "${GH_TOKEN:?Set GH_TOKEN in .env}"
+    : "${DO_SSH_KEY_FINGERPRINT:?Set DO_SSH_KEY_FINGERPRINT in .env}"
+
+    # Template the cloud-init script
+    local tmp_init
+    tmp_init=$(mktemp)
+    sed \
+        -e "s|__DO_API_TOKEN__|$DO_API_TOKEN|g" \
+        -e "s|__GH_TOKEN__|$GH_TOKEN|g" \
+        -e "s|__REPO__|$repo|g" \
+        -e "s|__BRANCH__|$branch|g" \
+        -e "s|__SETUP_CMD__|$setup_cmd|g" \
+        "$FACTORY_DIR/lib/cloud-init.sh.tpl" > "$tmp_init"
+
+    local droplet_name="factory-$(date +%s)"
+    echo "Creating droplet: $droplet_name"
+    echo "  Repo:   $repo"
+    echo "  Branch: $branch"
+    echo "  Size:   $size"
+    echo "  Region: $region"
+    echo ""
+
+    local droplet_id
+    droplet_id=$(doctl compute droplet create "$droplet_name" \
+        --image ubuntu-24-04-x64 \
+        --size "$size" \
+        --region "$region" \
+        --ssh-keys "$DO_SSH_KEY_FINGERPRINT" \
+        --user-data-file "$tmp_init" \
+        --tag-name factory \
+        --wait \
+        --format ID \
+        --no-header)
+
+    rm -f "$tmp_init"
+
+    # Get the IP
+    local ip
+    ip=$(doctl compute droplet get "$droplet_id" --format PublicIPv4 --no-header)
+
+    echo "Droplet created: $droplet_name (ID: $droplet_id)"
+    echo "IP: $ip"
+    echo ""
+    echo "Waiting for bootstrap to complete..."
+    echo "(cloud-init installs deps + clones repo — usually 2-3 minutes)"
+    echo ""
+
+    # Poll for bootstrap completion
+    local attempts=0
+    local max_attempts=60
+    while [ $attempts -lt $max_attempts ]; do
+        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "root@$ip" \
+            "test -f /root/.bootstrap-complete" 2>/dev/null; then
+            echo "Bootstrap complete."
+            break
+        fi
+        attempts=$((attempts + 1))
+        sleep 5
+    done
+
+    if [ $attempts -eq $max_attempts ]; then
+        echo "Warning: Bootstrap may not have completed. Check manually:"
+        echo "  ssh root@$ip cat /var/log/cloud-init-output.log"
+    fi
+
+    echo ""
+    echo "Next steps:"
+    echo "  1. Authenticate Claude:  factory auth $ip"
+    echo "  2. Run your plan:        factory run $ip <plan-file>"
+}
+
+# ─── auth ───────────────────────────────────────────────
+
+cmd_auth() {
+    local ip="${1:?Usage: factory auth <droplet-ip>}"
+
+    echo "Opening SSH tunnel for Claude OAuth..."
+    echo ""
+    echo "Once connected:"
+    echo "  1. Run: claude"
+    echo "  2. It will print an OAuth URL — open it in your browser"
+    echo "  3. Sign in. The callback flows through the SSH tunnel."
+    echo "  4. Once authenticated, type /exit to quit Claude"
+    echo "  5. Disconnect from SSH (ctrl+d)"
+    echo ""
+
+    ssh -o StrictHostKeyChecking=no \
+        -L 7160:localhost:7160 \
+        -L 7161:localhost:7161 \
+        -L 7162:localhost:7162 \
+        -L 7163:localhost:7163 \
+        -L 7164:localhost:7164 \
+        "root@$ip"
+}
+
+# ─── run ────────────────────────────────────────────────
+
+cmd_run() {
+    local ip="${1:?Usage: factory run <droplet-ip> <plan-file>}"
+    local plan_file="${2:?Usage: factory run <droplet-ip> <plan-file>}"
+
+    # Resolve plan_file relative to caller's directory
+    if [[ "$plan_file" != /* ]]; then
+        plan_file="$PROJECT_DIR/$plan_file"
+    fi
+
+    if [ ! -f "$plan_file" ]; then
+        # Also check Factory's plans directory
+        local factory_plan="$FACTORY_DIR/plans/$(basename "$plan_file")"
+        if [ -f "$factory_plan" ]; then
+            plan_file="$factory_plan"
+        else
+            echo "Error: Plan file not found: $plan_file"
+            exit 1
+        fi
+    fi
+
+    echo "Uploading plan to droplet..."
+    scp -o StrictHostKeyChecking=no "$plan_file" "root@$ip:/root/plan.md"
+
+    echo "Starting autonomous agent..."
+    ssh -o StrictHostKeyChecking=no "root@$ip" \
+        "nohup bash /root/agent-run.sh > /root/agent-startup.log 2>&1 &"
+
+    echo ""
+    echo "Agent is running autonomously on $ip"
+    echo "The droplet will self-destruct when the agent finishes."
+    echo ""
+    echo "Monitor progress:"
+    echo "  factory logs $ip"
+    echo ""
+    echo "Manual teardown (if needed):"
+    echo "  factory teardown $ip"
+}
+
+# ─── status ─────────────────────────────────────────────
+
+cmd_status() {
+    echo "Factory droplets:"
+    echo ""
+    doctl compute droplet list --tag-name factory \
+        --format ID,Name,PublicIPv4,Status,Memory,VCPUs
+}
+
+# ─── logs ───────────────────────────────────────────────
+
+cmd_logs() {
+    local ip="${1:?Usage: factory logs <droplet-ip>}"
+    ssh -o StrictHostKeyChecking=no "root@$ip" "tail -f /root/agent.log /root/agent-startup.log" 2>/dev/null
+}
+
+# ─── teardown ───────────────────────────────────────────
+
+cmd_teardown() {
+    if [ "${1:-}" = "--all" ]; then
+        echo "Destroying ALL factory droplets..."
+        doctl compute droplet list --tag-name factory --format ID --no-header | while read -r id; do
+            echo "Deleting droplet $id"
+            doctl compute droplet delete "$id" --force
+        done
+        echo "Done."
+    elif [ -n "${1:-}" ]; then
+        # Assume it's an IP — find the droplet
+        local ip="$1"
+        local droplet_id
+        droplet_id=$(doctl compute droplet list --tag-name factory --format ID,PublicIPv4 --no-header \
+            | grep "$ip" | awk '{print $1}')
+        if [ -n "$droplet_id" ]; then
+            echo "Deleting droplet $droplet_id ($ip)..."
+            doctl compute droplet delete "$droplet_id" --force
+            echo "Done."
+        else
+            echo "No factory droplet found with IP: $ip"
+            exit 1
+        fi
+    else
+        echo "Usage: factory teardown <droplet-ip> | --all"
+        exit 1
+    fi
+}
+
+# ─── main ───────────────────────────────────────────────
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+    plan)     cmd_plan "$@" ;;
+    launch)   cmd_launch "$@" ;;
+    auth)     cmd_auth "$@" ;;
+    run)      cmd_run "$@" ;;
+    status)   cmd_status ;;
+    logs)     cmd_logs "$@" ;;
+    teardown) cmd_teardown "$@" ;;
+    *)        usage ;;
+esac
