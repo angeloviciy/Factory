@@ -15,6 +15,10 @@ if [ -f "$FACTORY_DIR/.env" ]; then
     set +a
 fi
 
+# SSH options used by all remote commands
+SSH_KEY_PATH="${SSH_KEY_PATH:-~/.ssh/id_ed25519}"
+SSH_OPTS="-o StrictHostKeyChecking=no -i ${SSH_KEY_PATH/#\~/$HOME}"
+
 # Auto-detect repo from current git directory
 detect_repo() {
     local remote
@@ -195,7 +199,7 @@ cmd_launch() {
     local attempts=0
     local max_attempts=60
     while [ $attempts -lt $max_attempts ]; do
-        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "root@$ip" \
+        if ssh $SSH_OPTS -o ConnectTimeout=5 "root@$ip" \
             "test -f /root/.bootstrap-complete" 2>/dev/null; then
             echo "Bootstrap complete."
             break
@@ -223,20 +227,21 @@ cmd_auth() {
     echo "Opening SSH tunnel for Claude OAuth..."
     echo ""
     echo "Once connected:"
-    echo "  1. Run: claude"
+    echo "  1. Run: su - factory -c claude"
     echo "  2. It will print an OAuth URL — open it in your browser"
     echo "  3. Sign in. The callback flows through the SSH tunnel."
     echo "  4. Once authenticated, type /exit to quit Claude"
     echo "  5. Disconnect from SSH (ctrl+d)"
     echo ""
 
-    ssh -o StrictHostKeyChecking=no \
+    ssh $SSH_OPTS \
         -L 7160:localhost:7160 \
         -L 7161:localhost:7161 \
         -L 7162:localhost:7162 \
         -L 7163:localhost:7163 \
         -L 7164:localhost:7164 \
-        "root@$ip"
+        "root@$ip" \
+        -t "su - factory -c claude"
 }
 
 # ─── run ────────────────────────────────────────────────
@@ -262,11 +267,12 @@ cmd_run() {
     fi
 
     echo "Uploading plan to droplet..."
-    scp -o StrictHostKeyChecking=no "$plan_file" "root@$ip:/root/plan.md"
+    scp $SSH_OPTS "$plan_file" "root@$ip:/home/factory/plan.md"
+    ssh $SSH_OPTS "root@$ip" "chown factory:factory /home/factory/plan.md"
 
     echo "Starting autonomous agent..."
-    ssh -o StrictHostKeyChecking=no "root@$ip" \
-        "nohup bash /root/agent-run.sh > /root/agent-startup.log 2>&1 &"
+    ssh $SSH_OPTS "root@$ip" \
+        "su - factory -c 'nohup bash ~/agent-run.sh > ~/agent-startup.log 2>&1 &'"
 
     echo ""
     echo "Agent is running autonomously on $ip"
@@ -292,7 +298,7 @@ cmd_status() {
 
 cmd_logs() {
     local ip="${1:?Usage: factory logs <droplet-ip>}"
-    ssh -o StrictHostKeyChecking=no "root@$ip" "tail -f /root/agent.log /root/agent-startup.log" 2>/dev/null
+    ssh $SSH_OPTS "root@$ip" "tail -f /home/factory/agent.log /home/factory/agent-startup.log" 2>/dev/null
 }
 
 # ─── teardown ───────────────────────────────────────────
