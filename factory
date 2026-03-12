@@ -160,6 +160,7 @@ cmd_launch() {
         -e "s|__REPO__|$repo|g" \
         -e "s|__BRANCH__|$branch|g" \
         -e "s|__SETUP_CMD__|$setup_cmd|g" \
+        -e "s|__FACTORY_WEBHOOK_URL__|${FACTORY_WEBHOOK_URL:-}|g" \
         "$FACTORY_DIR/lib/cloud-init.sh.tpl" > "$tmp_init"
 
     local droplet_name="factory-$(date +%s)"

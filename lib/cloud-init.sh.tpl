@@ -10,6 +10,7 @@ GH_TOKEN="__GH_TOKEN__"
 REPO="__REPO__"
 BRANCH="__BRANCH__"
 SETUP_CMD="__SETUP_CMD__"
+FACTORY_WEBHOOK_URL="__FACTORY_WEBHOOK_URL__"
 
 # === Self-destruct on any exit (safety net for bootstrap failures) ===
 DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
@@ -31,6 +32,7 @@ FACTORY_HOME="/home/factory"
 cat > "$FACTORY_HOME/.secrets" <<SECRETS
 export GH_TOKEN="$GH_TOKEN"
 export DO_API_TOKEN="$DO_API_TOKEN"
+export FACTORY_WEBHOOK_URL="$FACTORY_WEBHOOK_URL"
 SECRETS
 chmod 600 "$FACTORY_HOME/.secrets"
 chown factory:factory "$FACTORY_HOME/.secrets"
@@ -83,12 +85,191 @@ source ~/.secrets
 DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
 
 self_destruct() {
-    echo "[factory] Agent complete. Self-destructing droplet $DROPLET_ID..."
+    echo "[factory] Self-destructing droplet $DROPLET_ID..."
     curl -s -X DELETE \
         -H "Authorization: Bearer $DO_API_TOKEN" \
         "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
 }
-trap self_destruct EXIT
+
+generate_summary() {
+    local log_file="$HOME/agent.log"
+    local summary_file="$HOME/summary.md"
+    local branch="$1"
+    local repo="$2"
+
+    if [ ! -s "$log_file" ]; then
+        cat > "$summary_file" <<SUMMARY
+# Factory Run Summary
+
+**Status**: failure
+**Error**: Agent failed before producing output
+
+## Startup Log
+\`\`\`
+$(cat "$HOME/agent-startup.log" 2>/dev/null || echo "No startup log available")
+\`\`\`
+SUMMARY
+        echo "failure"
+        return
+    fi
+
+    # Parse the result line (last line with type=result)
+    local result_line
+    result_line=$(jq -r 'select(.type == "result")' "$log_file" 2>/dev/null | tail -1)
+
+    local status="failure"
+    local duration_ms=""
+    local duration_fmt="unknown"
+    local cost="unknown"
+    local turns="unknown"
+    local model="unknown"
+
+    if [ -n "$result_line" ]; then
+        local is_error
+        is_error=$(echo "$result_line" | jq -r '.is_error // false')
+        if [ "$is_error" = "false" ]; then
+            status="success"
+        fi
+
+        duration_ms=$(echo "$result_line" | jq -r '.duration_ms // empty')
+        if [ -n "$duration_ms" ]; then
+            local secs=$((duration_ms / 1000))
+            local mins=$((secs / 60))
+            local remaining_secs=$((secs % 60))
+            duration_fmt="${mins}m ${remaining_secs}s"
+        fi
+
+        cost=$(echo "$result_line" | jq -r '.total_cost_usd // "unknown"')
+        turns=$(echo "$result_line" | jq -r '.num_turns // "unknown"')
+    fi
+
+    # Extract model from init/system line
+    model=$(jq -r 'select(.type == "system") | .model // empty' "$log_file" 2>/dev/null | head -1)
+    if [ -z "$model" ]; then
+        model="unknown"
+    fi
+
+    # Files modified and commit count
+    local files_modified=""
+    local commit_count="0"
+    if git -C "$HOME/repo" rev-parse HEAD >/dev/null 2>&1; then
+        files_modified=$(git -C "$HOME/repo" diff --name-only "origin/$branch..$branch" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
+        commit_count=$(git -C "$HOME/repo" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo "0")
+    fi
+
+    cat > "$summary_file" <<SUMMARY
+# Factory Run Summary
+
+- **Status**: $status
+- **Duration**: $duration_fmt
+- **Cost**: \$$cost
+- **Turns**: $turns
+- **Model**: $model
+- **Files modified**: ${files_modified:-none}
+- **Commits**: $commit_count
+- **Repo**: $repo
+- **Branch**: $branch
+SUMMARY
+
+    echo "$status"
+}
+
+on_exit() {
+    set +e
+
+    echo "[factory] Running on_exit cleanup..."
+
+    cd ~/repo 2>/dev/null || true
+    local branch
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+    local repo
+    repo=$(git remote get-url origin 2>/dev/null | sed -E 's|.*github\.com[:/]||; s|\.git$||' || echo "unknown")
+
+    # 1. Generate summary
+    echo "[factory] Generating summary..."
+    local status
+    status=$(generate_summary "$branch" "$repo") || true
+
+    # 2. Create gist with full log + summary
+    echo "[factory] Creating gist..."
+    local gist_url=""
+    local gist_files=""
+    if [ -f "$HOME/summary.md" ]; then
+        gist_files="$HOME/summary.md"
+    fi
+    if [ -f "$HOME/agent.log" ]; then
+        gist_files="$gist_files $HOME/agent.log"
+    fi
+    if [ -f "$HOME/plan.md" ]; then
+        gist_files="$gist_files $HOME/plan.md"
+    fi
+    if [ -n "$gist_files" ]; then
+        gist_url=$(gh gist create $gist_files \
+            --desc "Factory run: $repo $branch — $status" \
+            2>/dev/null | tail -1) || true
+    fi
+    echo "[factory] Gist: ${gist_url:-not created}"
+
+    # 3. Comment on PR (if it exists)
+    echo "[factory] Checking for PR..."
+    local pr_number=""
+    local pr_url=""
+    pr_number=$(gh pr list --head "$branch" --json number --jq '.[0].number' 2>/dev/null) || true
+    if [ -n "$pr_number" ]; then
+        pr_url=$(gh pr view "$pr_number" --json url --jq '.url' 2>/dev/null) || true
+
+        local duration_line cost_line turns_line model_line files_line commits_line
+        duration_line=$(grep '^\- \*\*Duration\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Duration**: unknown")
+        cost_line=$(grep '^\- \*\*Cost\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Cost**: unknown")
+        turns_line=$(grep '^\- \*\*Turns\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Turns**: unknown")
+        model_line=$(grep '^\- \*\*Model\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Model**: unknown")
+        files_line=$(grep '^\- \*\*Files modified\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Files modified**: unknown")
+        commits_line=$(grep '^\- \*\*Commits\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Commits**: unknown")
+
+        local pr_comment="## Factory Run Summary
+- **Status**: $status
+- $duration_line
+- $cost_line
+- $turns_line
+- $model_line
+- $files_line
+- $commits_line
+
+[Full agent log](${gist_url:-})"
+
+        gh pr comment "$pr_number" --body "$pr_comment" 2>/dev/null || true
+        echo "[factory] Commented on PR #$pr_number"
+    fi
+
+    # 4. Send ntfy notification
+    if [ -n "${FACTORY_WEBHOOK_URL:-}" ]; then
+        echo "[factory] Sending ntfy notification..."
+        local duration_short
+        duration_short=$(grep '^\- \*\*Duration\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/.*: //' || echo "unknown")
+        local cost_short
+        cost_short=$(grep '^\- \*\*Cost\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/.*: //' || echo "unknown")
+
+        local ntfy_body="Branch: $branch | Duration: $duration_short | Cost: $cost_short"
+        if [ -n "$gist_url" ]; then
+            ntfy_body="$ntfy_body | $gist_url"
+        fi
+        if [ "$status" = "success" ] && [ -n "$pr_url" ]; then
+            ntfy_body="$ntfy_body | PR: $pr_url"
+        fi
+
+        curl -s \
+            -H "Title: Factory: $status — $repo" \
+            -d "$ntfy_body" \
+            "$FACTORY_WEBHOOK_URL" >/dev/null 2>&1 || true
+        echo "[factory] Notification sent"
+    fi
+
+    # 5. Self-destruct
+    echo "[factory] Done. Droplet will self-destruct."
+    self_destruct || true
+}
+
+trap on_exit EXIT
 
 cd ~/repo
 
@@ -137,7 +318,7 @@ Review the changes carefully before merging."
         2>/dev/null || echo "[factory] PR already exists or could not be created"
 fi
 
-echo "[factory] Done. Droplet will self-destruct."
+echo "[factory] Agent run complete. Cleanup will run via EXIT trap."
 AGENT
 chmod +x "$FACTORY_HOME/agent-run.sh"
 chown factory:factory "$FACTORY_HOME/agent-run.sh"
