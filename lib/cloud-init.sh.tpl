@@ -153,7 +153,7 @@ SUMMARY
     local files_modified=""
     local commit_count="0"
     if git -C "$HOME/repo" rev-parse HEAD >/dev/null 2>&1; then
-        files_modified=$(git -C "$HOME/repo" diff --name-only "origin/$branch..$branch" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
+        files_modified=$(git -C "$HOME/repo" diff --name-only "origin/$branch" "$branch" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
         commit_count=$(git -C "$HOME/repo" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo "0")
     fi
 
@@ -170,6 +170,17 @@ SUMMARY
 - **Repo**: $repo
 - **Branch**: $branch
 SUMMARY
+
+    # Write sourceable env file for use by on_exit
+    cat > "$HOME/summary.env" <<ENV
+SUMMARY_STATUS=$status
+SUMMARY_DURATION=$duration_fmt
+SUMMARY_COST=$cost
+SUMMARY_TURNS=$turns
+SUMMARY_MODEL=$model
+SUMMARY_FILES=${files_modified:-none}
+SUMMARY_COMMITS=$commit_count
+ENV
 
     echo "$status"
 }
@@ -218,22 +229,16 @@ on_exit() {
     if [ -n "$pr_number" ]; then
         pr_url=$(gh pr view "$pr_number" --json url --jq '.url' 2>/dev/null) || true
 
-        local duration_line cost_line turns_line model_line files_line commits_line
-        duration_line=$(grep '^\- \*\*Duration\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Duration**: unknown")
-        cost_line=$(grep '^\- \*\*Cost\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Cost**: unknown")
-        turns_line=$(grep '^\- \*\*Turns\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Turns**: unknown")
-        model_line=$(grep '^\- \*\*Model\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Model**: unknown")
-        files_line=$(grep '^\- \*\*Files modified\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Files modified**: unknown")
-        commits_line=$(grep '^\- \*\*Commits\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/^- //' || echo "**Commits**: unknown")
+        source "$HOME/summary.env" 2>/dev/null || true
 
         local pr_comment="## Factory Run Summary
-- **Status**: $status
-- $duration_line
-- $cost_line
-- $turns_line
-- $model_line
-- $files_line
-- $commits_line
+- **Status**: ${SUMMARY_STATUS:-$status}
+- **Duration**: ${SUMMARY_DURATION:-unknown}
+- **Cost**: \$${SUMMARY_COST:-unknown}
+- **Turns**: ${SUMMARY_TURNS:-unknown}
+- **Model**: ${SUMMARY_MODEL:-unknown}
+- **Files modified**: ${SUMMARY_FILES:-unknown}
+- **Commits**: ${SUMMARY_COMMITS:-unknown}
 
 [Full agent log](${gist_url:-})"
 
@@ -244,12 +249,9 @@ on_exit() {
     # 4. Send ntfy notification
     if [ -n "${FACTORY_WEBHOOK_URL:-}" ]; then
         echo "[factory] Sending ntfy notification..."
-        local duration_short
-        duration_short=$(grep '^\- \*\*Duration\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/.*: //' || echo "unknown")
-        local cost_short
-        cost_short=$(grep '^\- \*\*Cost\*\*' "$HOME/summary.md" 2>/dev/null | sed 's/.*: //' || echo "unknown")
+        source "$HOME/summary.env" 2>/dev/null || true
 
-        local ntfy_body="Branch: $branch | Duration: $duration_short | Cost: $cost_short"
+        local ntfy_body="Branch: $branch | Duration: ${SUMMARY_DURATION:-unknown} | Cost: \$${SUMMARY_COST:-unknown}"
         if [ -n "$gist_url" ]; then
             ntfy_body="$ntfy_body | $gist_url"
         fi
