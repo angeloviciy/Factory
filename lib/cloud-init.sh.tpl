@@ -79,8 +79,10 @@ fi
 # === Write the agent runner script ===
 cat > "$FACTORY_HOME/agent-run.sh" <<'AGENT'
 #!/bin/bash
-set -euo pipefail
+# No set -e — we handle errors manually so reviewer/fixer always get a chance to run
+set -uo pipefail
 source ~/.secrets
+export GH_TOKEN
 
 DROPLET_ID=$(curl -s http://169.254.169.254/metadata/v1/id)
 
@@ -91,104 +93,10 @@ self_destruct() {
         "https://api.digitalocean.com/v2/droplets/$DROPLET_ID"
 }
 
-generate_summary() {
-    local log_file="$HOME/agent.log"
-    local summary_file="$HOME/summary.md"
-    local branch="$1"
-    local repo="$2"
-
-    if [ ! -s "$log_file" ]; then
-        cat > "$summary_file" <<SUMMARY
-# Factory Run Summary
-
-**Status**: failure
-**Error**: Agent failed before producing output
-
-## Startup Log
-\`\`\`
-$(cat "$HOME/agent-startup.log" 2>/dev/null || echo "No startup log available")
-\`\`\`
-SUMMARY
-        echo "failure"
-        return
-    fi
-
-    # Parse the result line (last line with type=result)
-    local result_line
-    result_line=$(jq -r 'select(.type == "result")' "$log_file" 2>/dev/null | tail -1)
-
-    local status="failure"
-    local duration_ms=""
-    local duration_fmt="unknown"
-    local cost="unknown"
-    local turns="unknown"
-    local model="unknown"
-
-    if [ -n "$result_line" ]; then
-        local is_error
-        is_error=$(echo "$result_line" | jq -r '.is_error // false')
-        if [ "$is_error" = "false" ]; then
-            status="success"
-        fi
-
-        duration_ms=$(echo "$result_line" | jq -r '.duration_ms // empty')
-        if [ -n "$duration_ms" ]; then
-            local secs=$((duration_ms / 1000))
-            local mins=$((secs / 60))
-            local remaining_secs=$((secs % 60))
-            duration_fmt="${mins}m ${remaining_secs}s"
-        fi
-
-        cost=$(echo "$result_line" | jq -r '.total_cost_usd // "unknown"')
-        turns=$(echo "$result_line" | jq -r '.num_turns // "unknown"')
-    fi
-
-    # Extract model from init/system line
-    model=$(jq -r 'select(.type == "system") | .model // empty' "$log_file" 2>/dev/null | head -1)
-    if [ -z "$model" ]; then
-        model="unknown"
-    fi
-
-    # Files modified and commit count
-    local files_modified=""
-    local commit_count="0"
-    if git -C "$HOME/repo" rev-parse HEAD >/dev/null 2>&1; then
-        files_modified=$(git -C "$HOME/repo" diff --name-only "origin/$branch" "$branch" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
-        commit_count=$(git -C "$HOME/repo" rev-list --count "origin/$branch..$branch" 2>/dev/null || echo "0")
-    fi
-
-    cat > "$summary_file" <<SUMMARY
-# Factory Run Summary
-
-- **Status**: $status
-- **Duration**: $duration_fmt
-- **Cost**: \$$cost
-- **Turns**: $turns
-- **Model**: $model
-- **Files modified**: ${files_modified:-none}
-- **Commits**: $commit_count
-- **Repo**: $repo
-- **Branch**: $branch
-SUMMARY
-
-    # Write sourceable env file for use by on_exit
-    cat > "$HOME/summary.env" <<ENV
-SUMMARY_STATUS=$status
-SUMMARY_DURATION=$duration_fmt
-SUMMARY_COST=$cost
-SUMMARY_TURNS=$turns
-SUMMARY_MODEL=$model
-SUMMARY_FILES=${files_modified:-none}
-SUMMARY_COMMITS=$commit_count
-ENV
-
-    echo "$status"
-}
-
-on_exit() {
+# Cleanup runs AFTER all three phases (build, review, fix), not on first error
+cleanup() {
     set +e
-
-    echo "[factory] Running on_exit cleanup..."
+    echo "[factory] Running cleanup..."
 
     cd ~/repo 2>/dev/null || true
     local branch
@@ -196,82 +104,91 @@ on_exit() {
     local repo
     repo=$(git remote get-url origin 2>/dev/null | sed -E 's|.*github\.com[:/]||; s|\.git$||' || echo "unknown")
 
-    # 1. Generate summary
-    echo "[factory] Generating summary..."
-    local status
-    status=$(generate_summary "$branch" "$repo") || true
+    # Parse summary from builder log (stream-json, one JSON object per line)
+    local status="failure"
+    local duration_fmt="unknown"
+    local cost="unknown"
+    local turns="unknown"
+    local model="unknown"
 
-    # 2. Create gist with full log + summary
+    if [ -s ~/agent.log ]; then
+        # Result is always the last line
+        local result_line
+        result_line=$(grep '"type":"result"' ~/agent.log | tail -1 || true)
+        if [ -n "$result_line" ]; then
+            local is_error
+            is_error=$(echo "$result_line" | jq -r '.is_error // false')
+            [ "$is_error" = "false" ] && status="success"
+            local duration_ms
+            duration_ms=$(echo "$result_line" | jq -r '.duration_ms // empty')
+            if [ -n "$duration_ms" ]; then
+                duration_fmt="$((duration_ms / 60000))m $((duration_ms % 60000 / 1000))s"
+            fi
+            cost=$(echo "$result_line" | jq -r '.total_cost_usd // "unknown"')
+            turns=$(echo "$result_line" | jq -r '.num_turns // "unknown"')
+        fi
+        model=$(grep '"type":"system"' ~/agent.log | head -1 | jq -r '.model // "unknown"' || echo "unknown")
+    fi
+
+    local files_modified="none"
+    local commit_count="0"
+    files_modified=$(git diff --name-only "origin/$branch" "$branch" 2>/dev/null | tr '\n' ', ' | sed 's/,$//' || echo "none")
+    commit_count=$(git rev-list --count "origin/$branch..$branch" 2>/dev/null || echo "0")
+
+    # Build summary
+    local summary="## Factory Run Summary
+- **Status**: $status
+- **Duration**: $duration_fmt
+- **Cost**: \$$cost
+- **Turns**: $turns
+- **Model**: $model
+- **Files**: ${files_modified:-none}
+- **Commits**: $commit_count
+- **Repo**: $repo
+- **Branch**: $branch"
+
+    echo "$summary" > ~/summary.md
+
+    # Create gist with all logs
     echo "[factory] Creating gist..."
-    local gist_url=""
     local gist_files=""
-    if [ -f "$HOME/summary.md" ]; then
-        gist_files="$HOME/summary.md"
-    fi
-    if [ -f "$HOME/agent.log" ]; then
-        gist_files="$gist_files $HOME/agent.log"
-    fi
-    if [ -f "$HOME/plan.md" ]; then
-        gist_files="$gist_files $HOME/plan.md"
-    fi
+    for f in ~/summary.md ~/agent.log ~/reviewer.log ~/fixer.log ~/plan.md; do
+        [ -s "$f" ] && gist_files="$gist_files $f"
+    done
+    local gist_url=""
     if [ -n "$gist_files" ]; then
-        gist_url=$(gh gist create $gist_files \
-            --desc "Factory run: $repo $branch — $status" \
-            2>/dev/null | tail -1) || true
+        gist_url=$(gh gist create $gist_files --desc "Factory: $repo $branch — $status" 2>&1 | tail -1) || true
     fi
-    echo "[factory] Gist: ${gist_url:-not created}"
+    echo "[factory] Gist: ${gist_url:-failed}"
 
-    # 3. Comment on PR (if it exists)
-    echo "[factory] Checking for PR..."
-    local pr_number=""
-    local pr_url=""
+    # Comment on PR
+    local pr_number
     pr_number=$(gh pr list --head "$branch" --json number --jq '.[0].number' 2>/dev/null) || true
     if [ -n "$pr_number" ]; then
+        local pr_url
         pr_url=$(gh pr view "$pr_number" --json url --jq '.url' 2>/dev/null) || true
-
-        source "$HOME/summary.env" 2>/dev/null || true
-
-        local pr_comment="## Factory Run Summary
-- **Status**: ${SUMMARY_STATUS:-$status}
-- **Duration**: ${SUMMARY_DURATION:-unknown}
-- **Cost**: \$${SUMMARY_COST:-unknown}
-- **Turns**: ${SUMMARY_TURNS:-unknown}
-- **Model**: ${SUMMARY_MODEL:-unknown}
-- **Files modified**: ${SUMMARY_FILES:-unknown}
-- **Commits**: ${SUMMARY_COMMITS:-unknown}
+        local comment="$summary
 
 [Full agent log](${gist_url:-})"
-
-        gh pr comment "$pr_number" --body "$pr_comment" 2>/dev/null || true
+        gh pr comment "$pr_number" --body "$comment" 2>&1 || true
         echo "[factory] Commented on PR #$pr_number"
     fi
 
-    # 4. Send ntfy notification
+    # Ntfy notification
     if [ -n "${FACTORY_WEBHOOK_URL:-}" ]; then
-        echo "[factory] Sending ntfy notification..."
-        source "$HOME/summary.env" 2>/dev/null || true
-
-        local ntfy_body="Branch: $branch | Duration: ${SUMMARY_DURATION:-unknown} | Cost: \$${SUMMARY_COST:-unknown}"
-        if [ -n "$gist_url" ]; then
-            ntfy_body="$ntfy_body | $gist_url"
-        fi
-        if [ "$status" = "success" ] && [ -n "$pr_url" ]; then
-            ntfy_body="$ntfy_body | PR: $pr_url"
-        fi
-
         curl -s \
             -H "Title: Factory: $status — $repo" \
-            -d "$ntfy_body" \
+            -d "Branch: $branch | Duration: $duration_fmt | Cost: \$$cost | ${gist_url:-no gist}" \
             "$FACTORY_WEBHOOK_URL" >/dev/null 2>&1 || true
         echo "[factory] Notification sent"
     fi
 
-    # 5. Self-destruct
-    echo "[factory] Done. Droplet will self-destruct."
+    # Self-destruct last
+    echo "[factory] Done. Self-destructing."
     self_destruct || true
 }
 
-trap on_exit EXIT
+trap cleanup EXIT
 
 cd ~/repo
 
