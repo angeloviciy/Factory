@@ -23,6 +23,18 @@ factory status                            List running factory droplets
 factory teardown [--all]                  Destroy orphaned droplets
 ```
 
+## Quick Reference
+
+| Command | Description |
+|---------|-------------|
+| `factory plan` | Generate an implementation plan from a PRD |
+| `factory launch` | Create and bootstrap a DigitalOcean droplet |
+| `factory auth` | Open SSH tunnel for Claude OAuth |
+| `factory run` | Ship a plan to a droplet and start the autonomous agent |
+| `factory status` | List running factory droplets |
+| `factory logs` | Stream logs from a running droplet |
+| `factory teardown` | Destroy orphaned droplets |
+
 ## Setup
 
 See [SETUP.md](SETUP.md) for prerequisites and configuration.
