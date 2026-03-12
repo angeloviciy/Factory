@@ -300,7 +300,7 @@ CLAUDE_EXIT=$?
 echo "[factory] Agent finished at $(date) (exit code: $CLAUDE_EXIT)"
 
 # Extract session ID from builder for potential resume later
-SESSION_ID=$(tail -1 ~/agent.log | jq -r '.session_id // empty' 2>/dev/null || true)
+SESSION_ID=$(head -1 ~/agent.log | jq -r '.session_id // empty' 2>/dev/null || true)
 if [ -z "$SESSION_ID" ]; then
     echo "[factory] Warning: Could not extract session ID from agent log"
 fi
@@ -345,23 +345,19 @@ fi
 if [ -n "$PR_NUMBER" ] && [ -n "$REPO_NAME" ]; then
     echo "[factory] Starting reviewer agent at $(date)"
 
-    DIFF=$(git diff "origin/main..HEAD")
+    git diff "origin/main..HEAD" > ~/diff.txt
 
-    claude -p "You are a code reviewer. Review the following diff against the implementation plan.
+    claude -p "You are a code reviewer. Review the changes on this branch against the implementation plan.
 
-Post your review on PR #${PR_NUMBER} in the ${REPO_NAME} repository using gh api.
+Read ~/diff.txt for the full diff. Also explore the codebase with Read/Glob/Grep as needed.
 
-If you find issues, post a review with line-level comments using:
-gh api repos/${REPO_NAME}/pulls/${PR_NUMBER}/reviews --method POST -f event=COMMENT -f body='Summary' --jsonc comments='[...]'
+Check for: bugs, edge cases, missed requirements from the plan, security issues.
 
-If everything looks good, post a single comment: 'LGTM — no issues found' using:
-gh api repos/${REPO_NAME}/pulls/${PR_NUMBER}/reviews --method POST -f event=APPROVE -f body='LGTM — no issues found'
+Post your review on PR #${PR_NUMBER} in the ${REPO_NAME} repository using gh CLI.
+If you find issues, post a review with comments using gh api.
+If everything looks good, post a single approving review saying LGTM.
 
-PLAN:
-$PLAN
-
-DIFF:
-$DIFF" \
+The implementation plan is at ~/plan.md — read it for full context." \
         --allowedTools "Read,Glob,Grep,Bash" \
         --dangerously-skip-permissions \
         --max-turns 30 \
