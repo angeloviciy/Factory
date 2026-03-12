@@ -2,11 +2,11 @@
 
 Automated cloud development agents. Spin up ephemeral DigitalOcean VMs, run Claude Code autonomously against a plan, and get back a pull request.
 
-Inspired by Michael Truell's "third era" of software development — developers as architects, agents as builders.
+Inspired by Michael Truell's "third era" of agentic software development. I am too broke to use Cursor's Cloud VMs. Digital Ocean + Claude Max subscription works much better for me.
 
 ## How it works
 
-1. **Plan locally** — write a PRD, then use Claude to generate a step-by-step implementation plan on your Mac (free, read-only)
+1. **Plan locally** — write a PRD, then use Claude to generate a step-by-step implementation plan on your Mac 
 2. **Launch a droplet** — Factory spins up a DigitalOcean VM, clones your repo, installs deps
 3. **Authenticate once** — SSH in, complete Claude OAuth via browser tunnel (~60 seconds)
 4. **Run the agent** — Claude Code executes your plan autonomously on the droplet
