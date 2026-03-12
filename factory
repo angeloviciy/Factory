@@ -299,7 +299,7 @@ cmd_status() {
 
 cmd_logs() {
     local ip="${1:?Usage: factory logs <droplet-ip>}"
-    ssh $SSH_OPTS "root@$ip" "tail -f /home/factory/agent.log /home/factory/agent-startup.log" 2>/dev/null
+    ssh $SSH_OPTS "root@$ip" "tail -f /home/factory/agent.log /home/factory/reviewer.log /home/factory/fixer.log /home/factory/agent-startup.log" 2>/dev/null
 }
 
 # ─── teardown ───────────────────────────────────────────
