@@ -299,7 +299,15 @@ $PLAN" \
 CLAUDE_EXIT=$?
 echo "[factory] Agent finished at $(date) (exit code: $CLAUDE_EXIT)"
 
+# Extract session ID from builder for potential resume later
+SESSION_ID=$(head -1 ~/agent.log | jq -r '.session_id // empty' 2>/dev/null || true)
+if [ -z "$SESSION_ID" ]; then
+    echo "[factory] Warning: Could not extract session ID from agent log"
+fi
+
 # Push and create PR if there are commits ahead of origin
+PR_NUMBER=""
+REPO_NAME=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
 COMMITS_AHEAD=$(git rev-list --count "origin/$BRANCH..$BRANCH" 2>/dev/null || echo "new")
 if [ "$COMMITS_AHEAD" != "0" ]; then
     git push -u origin "$BRANCH"
@@ -314,10 +322,77 @@ $(cat ~/plan.md)
 ---
 Review the changes carefully before merging."
 
-    gh pr create \
+    PR_URL=$(gh pr create \
         --title "factory: $(head -1 ~/plan.md | sed 's/^#* *//')" \
         --body "$PR_BODY" \
-        2>/dev/null || echo "[factory] PR already exists or could not be created"
+        2>/dev/null || echo "")
+
+    if [ -n "$PR_URL" ]; then
+        PR_NUMBER=$(echo "$PR_URL" | grep -o '[0-9]*$')
+        echo "[factory] PR created: $PR_URL (PR #$PR_NUMBER)"
+    else
+        # PR may already exist (created by builder agent) — try to find it
+        PR_NUMBER=$(gh pr view "$BRANCH" --json number -q .number 2>/dev/null || echo "")
+        if [ -n "$PR_NUMBER" ]; then
+            echo "[factory] Found existing PR #$PR_NUMBER for branch $BRANCH"
+        else
+            echo "[factory] PR could not be created or found"
+        fi
+    fi
+fi
+
+# === Reviewer agent phase ===
+if [ -n "$PR_NUMBER" ] && [ -n "$REPO_NAME" ]; then
+    echo "[factory] Starting reviewer agent at $(date)"
+
+    git diff "origin/main..HEAD" > ~/diff.txt
+
+    claude -p "You are a code reviewer. Review the changes on this branch against the implementation plan.
+
+Read ~/diff.txt for the full diff. Also explore the codebase with Read/Glob/Grep as needed.
+
+Check for: bugs, edge cases, missed requirements from the plan, security issues.
+
+Post your review on PR #${PR_NUMBER} in the ${REPO_NAME} repository using gh CLI.
+If you find issues, post a review with comments using gh api.
+If everything looks good, post a single approving review saying LGTM.
+
+The implementation plan is at ~/plan.md — read it for full context." \
+        --allowedTools "Read,Glob,Grep,Bash" \
+        --dangerously-skip-permissions \
+        --max-turns 30 \
+        --output-format stream-json \
+        --verbose \
+        > ~/reviewer.log 2>&1 || true
+
+    echo "[factory] Reviewer agent finished at $(date)"
+else
+    echo "[factory] Skipping reviewer: PR_NUMBER='$PR_NUMBER' REPO_NAME='${REPO_NAME:-}'"
+fi
+
+# === Builder fix pass (resumed session) ===
+if [ -n "$SESSION_ID" ] && [ -n "$PR_NUMBER" ] && [ -n "$REPO_NAME" ]; then
+    echo "[factory] Starting fixer agent at $(date)"
+
+    claude -p "Read the review comments on PR #${PR_NUMBER} in ${REPO_NAME} using:
+gh api repos/${REPO_NAME}/pulls/${PR_NUMBER}/reviews
+gh api repos/${REPO_NAME}/pulls/${PR_NUMBER}/comments
+
+If the reviewer said LGTM or approved with no issues, do nothing.
+
+Otherwise, fix every issue raised in the review comments. Commit and push your fixes.
+Do NOT include 'Co-Authored-By' lines in any commit messages." \
+        --resume "$SESSION_ID" \
+        --allowedTools "Read,Edit,Write,Bash,Glob,Grep" \
+        --dangerously-skip-permissions \
+        --max-turns 50 \
+        --output-format stream-json \
+        --verbose \
+        > ~/fixer.log 2>&1 || true
+
+    echo "[factory] Fixer agent finished at $(date)"
+else
+    echo "[factory] Skipping fixer: SESSION_ID='${SESSION_ID:-}' PR_NUMBER='$PR_NUMBER' REPO_NAME='${REPO_NAME:-}'"
 fi
 
 echo "[factory] Agent run complete. Cleanup will run via EXIT trap."
